@@ -1,0 +1,228 @@
+import RPi.GPIO as GPIO
+from picamera2 import Picamera2
+import cv2
+import numpy as np
+from time import sleep
+import time
+from collections import deque
+
+# --- 1. Hardware & GPIO Setup ---
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+in1, in2, en1 = 17, 18, 27
+in3, in4, en2 = 23, 24, 22
+
+pins = [in1, in2, en1, in3, in4, en2]
+for pin in pins:
+    GPIO.setup(pin, GPIO.OUT)
+
+pwm_left = GPIO.PWM(en1, 800)
+pwm_right = GPIO.PWM(en2, 800)
+pwm_left.start(0)
+pwm_right.start(0)
+
+# --- 2. PID & Global Variables ---
+Kp, Ki, Kd = 0.3, 0.005, 0.25
+integral, last_error = 0, 0
+sharp_threshold, base_speed = 80, 40
+last_movement = 0
+
+arrow_buffer = deque(maxlen=2)
+template_buffer = deque(maxlen=5)
+kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
+# --- TIMING ---
+latency_buffer = deque(maxlen=100)
+current_latency = 0
+avg_latency = 0
+
+# --- 3. Template Initialization ---
+orb = cv2.ORB_create(nfeatures=400, fastThreshold=30)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+TEMPLATE_FILES = {
+    "Button Code": "/home/rasp4/Downloads/Button code_05.04.2026.png",
+    "Fingerprint": "/home/rasp4/Downloads/Fingerprint full_05.04.2026.png",
+    "Recycle": "/home/rasp4/Downloads/Recycle full_05.04.2026.png",
+    "Warning": "/home/rasp4/Downloads/Warning_07.04.2026.png",
+    "QR Code": "/home/rasp4/Downloads/QR code full_05.04.2026.png"
+}
+
+template_descriptors = {}
+for name, path in TEMPLATE_FILES.items():
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is not None:
+        kp, des = orb.detectAndCompute(img, None)
+        template_descriptors[name] = des
+
+# --- 4. Vision Logic ---
+def classify_template(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    kp_q, des_q = orb.detectAndCompute(gray, None)
+    best_name, max_matches = "Unknown", 0
+    if des_q is not None:
+        for name, des_t in template_descriptors.items():
+            if des_t is not None:
+                matches = bf.match(des_t, des_q)
+                good = [m for m in matches if m.distance < 30]
+                if len(good) > max_matches:
+                    max_matches = len(good)
+                    best_name = name
+    template_buffer.append(best_name if max_matches >= 10 else "Unknown")
+    return max(set(template_buffer), key=template_buffer.count)
+
+def classify_symbol(frame):
+    current_id, found = "Unknown", False
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 7)
+    mask = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if hierarchy is not None:
+        for i, cnt in enumerate(contours):
+            if hierarchy[0][i][2] != -1: continue 
+            area = cv2.contourArea(cnt)
+            if not (2000 < area < 5000): continue
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
+            if 5 <= len(approx) <= 10:
+                try:
+                    hull_indices = cv2.convexHull(approx, returnPoints=False)
+                    if len(hull_indices) > 3:
+                        defects = cv2.convexityDefects(approx, hull_indices)
+                        if defects is not None:
+                            deep_defects = sum(1 for j in range(defects.shape[0]) if defects[j,0][3]/256.0 > 3.0)
+                            if deep_defects >= 1:
+                                x, y, w, h = cv2.boundingRect(approx)
+                                solidity = area / cv2.contourArea(cv2.convexHull(approx))
+                                if 0.45 <= solidity <= 0.75:
+                                    M = cv2.moments(approx)
+                                    if M["m00"] > 0:
+                                        cX = int(M["m10"]/M["m00"])
+                                        current_id = "Arrow Right" if cX > (x + w/2) else "Arrow Left"
+                                        found = True
+                                        break
+                except: 
+                    continue
+    arrow_buffer.append(current_id if found else "Unknown")
+    return max(set(arrow_buffer), key=arrow_buffer.count)
+
+# --- 5. Movement Logic ---
+def set_motor(left, right, mode="FORWARD"):
+    left, right = max(0, min(80, float(left))), max(0, min(80, float(right)))
+    if mode == "FORWARD":
+        GPIO.output(in1, 1); GPIO.output(in2, 0)
+        GPIO.output(in3, 1); GPIO.output(in4, 0)
+    elif mode == "REVERSE_LEFT":
+        GPIO.output(in1, 0); GPIO.output(in2, 1)
+        GPIO.output(in3, 1); GPIO.output(in4, 0)
+    elif mode == "REVERSE_RIGHT":
+        GPIO.output(in1, 1); GPIO.output(in2, 0)
+        GPIO.output(in3, 0); GPIO.output(in4, 1)
+    pwm_left.ChangeDutyCycle(left)
+    pwm_right.ChangeDutyCycle(right)
+
+def get_line_centroid(hsv, color_name):
+    COLOR_RANGES = {
+        "RED_LOW": {"low": np.array([0,100,100]), "high": np.array([10,255,255])},
+        "RED_HIGH": {"low": np.array([160,100,100]), "high": np.array([180,255,255])},
+        "YELLOW": {"low": np.array([20,100,100]), "high": np.array([40,255,255])},
+        "BLACK": {"low": np.array([0,0,0]), "high": np.array([180,255,137])}
+    }
+    if color_name == "RED":
+        m1 = cv2.inRange(hsv, COLOR_RANGES["RED_LOW"]["low"], COLOR_RANGES["RED_LOW"]["high"])
+        m2 = cv2.inRange(hsv, COLOR_RANGES["RED_HIGH"]["low"], COLOR_RANGES["RED_HIGH"]["high"])
+        mask = cv2.bitwise_or(m1, m2)
+    else:
+        mask = cv2.inRange(hsv, COLOR_RANGES[color_name]["low"], COLOR_RANGES[color_name]["high"])
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(c) > 500:
+            M = cv2.moments(c)
+            if M['m00'] != 0:
+                return int(M['m10']/M['m00']), int(M['m01']/M['m00']), mask
+    return None, None, mask
+
+# --- 6. Main Loop ---
+picam2 = Picamera2()
+picam2.configure(picam2.create_video_configuration(main={"format":"XRGB8888","size":(320,240)}))
+picam2.start()
+picam2.set_controls({"ExposureTime":5000})
+
+state, frame_count, N = 'LINE_FOLLOW', 0, 3
+
+try:
+    while True:
+        # --- START TIMING ---
+        t_start = time.perf_counter()
+
+        frame = picam2.capture_array()
+
+        roi_frame = frame[200:240, 0:320]
+        hsv = cv2.cvtColor(cv2.GaussianBlur(roi_frame,(5,5),0), cv2.COLOR_BGR2HSV)
+
+        cX, cY, _ = get_line_centroid(hsv, "RED")
+        if cX is None:
+            cX, cY, _ = get_line_centroid(hsv, "YELLOW")
+            if cX is None:
+                cX, cY, _ = get_line_centroid(hsv, "BLACK")
+
+        temp_val, sym_val = "Unknown", "Unknown"
+
+        if frame_count % N == 0:
+            temp_val = classify_template(frame)
+            if temp_val != "Unknown":
+                state = 'TEMPLATE_DETECTED'
+            else:
+                sym_val = classify_symbol(frame)
+                if sym_val != "Unknown":
+                    state = 'SHAPE_DETECTED'
+
+        if state == 'LINE_FOLLOW':
+            if cX is not None:
+                error = 160 - cX
+                integral = max(-500, min(500, integral + error))
+                control = (Kp * error) + (Ki * integral) + (Kd * (error - last_error))
+                last_error = error
+                set_motor(base_speed - control, base_speed + control)
+
+        elif state == 'TEMPLATE_DETECTED':
+            if temp_val == "Recycle":
+                set_motor(40, 40, "REVERSE_LEFT")
+                sleep(0.5)
+            elif temp_val in ["Warning", "Button Code"]:
+                set_motor(0, 0)
+                sleep(1.0)
+            state = "LINE_FOLLOW"
+
+        elif state == 'SHAPE_DETECTED':
+            if sym_val == "Arrow Right":
+                set_motor(40, 0)
+                sleep(0.5)
+            elif sym_val == "Arrow Left":
+                set_motor(0, 40)
+                sleep(0.5)
+            state = "LINE_FOLLOW"
+
+        # --- END TIMING ---
+        t_end = time.perf_counter()
+        current_latency = t_end - t_start
+
+        latency_buffer.append(current_latency)
+        avg_latency = sum(latency_buffer) / len(latency_buffer)
+
+        print(f"Current: {current_latency*1000:.2f} ms | Avg(100): {avg_latency*1000:.2f} ms")
+
+        cv2.imshow("Robot Dashboard", frame)
+        frame_count += 1
+
+        if cv2.waitKey(1) == ord('q'):
+            break
+
+finally:
+    set_motor(0, 0)
+    picam2.stop()
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
