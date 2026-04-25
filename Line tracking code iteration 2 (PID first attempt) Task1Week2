@@ -1,0 +1,152 @@
+import RPi.GPIO as GPIO
+import time
+from picamera2 import Picamera2
+import cv2
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# Pin Definitions
+in1, in2, en1 = 17, 18, 27  # Left Motor
+in3, in4, en2 = 23, 24, 22  # Right Motor
+
+
+# Setup pins
+pins = [in1, in2, en1, in3, in4, en2]
+for pin in pins:
+    GPIO.setup(pin, GPIO.OUT)
+
+# Initialize PWM outside the loop
+pwm_left = GPIO.PWM(en1, 1000)
+pwm_right = GPIO.PWM(en2, 1000)
+pwm_left.start(0)
+pwm_right.start(0)
+pwm_left.ChangeDutyCycle(0)
+pwm_right.ChangeDutyCycle(0)
+
+def forwards():
+    GPIO.output(in1, True)
+    GPIO.output(in2, False)
+    GPIO.output(in3, True)
+    GPIO.output(in4, False)
+    
+def backwards():
+    GPIO.output(in1, False)
+    GPIO.output(in2, True)
+    GPIO.output(in3, False)
+    GPIO.output(in4, True)
+
+def stop():
+    GPIO.output(in1, False)
+    GPIO.output(in2, False)
+    GPIO.output(in3, False)
+    GPIO.output(in4, False)
+    
+def left():
+    GPIO.output(in1, False)
+    GPIO.output(in2, True)
+    GPIO.output(in3, True)
+    GPIO.output(in4, False)
+    
+def right():
+    GPIO.output(in1, True)
+    GPIO.output(in2, False)
+    GPIO.output(in3, False)
+    GPIO.output(in4, True)
+    
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main = {"format": "XRGB8888", "size": (640,480)}))
+picam2.start()
+
+Kp = 0.7
+Ki = 0.005
+Kd = 0.3
+integral = 0
+last_error = 0
+	
+while True:
+    forwards()
+    image =  picam2.capture_array() #this is the live feed
+    gray = cv2.cvtColor(image,cv2.COLOR_BGR2GRAY) #converting to gray
+    _, blackimage = cv2.threshold(gray,127,255,cv2.THRESH_BINARY_INV) # convert to black #Thersh binary inv focuses on the white spots around the black area
+    mask = cv2.erode(blackimage, None, iterations=2)
+    mask = cv2.dilate(mask, None, iterations=2)
+    contours, hierarchy = cv2.findContours(image = mask, mode = cv2.RETR_EXTERNAL, method = cv2.CHAIN_APPROX_NONE) # RETR_EXTERNAL focuses on the silhouette of the grayscale
+        
+    if len(contours) > 0:
+        c = max(contours, key = cv2.contourArea)
+        cv2.drawContours(image = image, contours = contours,contourIdx=-1, color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA) #draws contours
+        M = cv2.moments(c)
+       
+        area = M['m00']
+
+        if M['m00'] != 0:
+            cX = int(M['m10'] / M['m00'])
+            cY = int(M['m01'] / M['m00'])
+        cv2.circle(image, (cX,cY),10, (0,0,255), -1)
+        cv2.imshow("Image",image)  
+        
+        print(f"Centroid found at: X={cX}, Y={cY}")
+        cv2.putText(image, f"({cX}, {cY})", (cX + 10, cY + 10), 
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+        error = 320 - cX
+        
+        if(error < -120):
+            P = Kp * error
+            integral += error
+            I = Ki * integral
+            derivative = error - last_error
+            D = Kd * derivative
+            control = P + I + D
+            last_error = error
+            right_speed = 25 -(error)
+            left_speed = 0
+            
+            left_speed = max(0, min(100, left_speed))
+            right_speed = max(0, min(100, right_speed))
+
+            pwm_left.ChangeDutyCycle(left_speed)
+            pwm_right.ChangeDutyCycle(right_speed)
+            
+            
+        elif(error > 120):
+            P = Kp * error
+            integral += error
+            I = Ki * integral
+            derivative = error - last_error
+            D = Kd * derivative
+            control = P + I + D
+            last_error = error
+            right_speed = 0
+            left_speed = 25 + (error)
+            left_speed = max(0, min(100, left_speed))
+            right_speed = max(0, min(100, right_speed))
+
+            pwm_left.ChangeDutyCycle(left_speed)
+            pwm_right.ChangeDutyCycle(right_speed)
+            
+        
+        P = Kp * error
+        integral += error
+        I = Ki * integral
+        derivative = error - last_error
+        D = Kd * derivative
+        control = P + I + D
+        last_error = error
+
+        left_speed = 50 - control
+        right_speed = 50 + control
+
+        left_speed = max(0, min(100, left_speed))
+        right_speed = max(0, min(100, right_speed))
+
+        pwm_left.ChangeDutyCycle(left_speed)
+        pwm_right.ChangeDutyCycle(right_speed)
+            
+    if cv2.waitKey(1) & 0xff ==ord('q'):
+        break
+        
+picam2.stop
+cv2.destroyAllWindows        
+
