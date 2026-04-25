@@ -1,0 +1,344 @@
+import RPi.GPIO as GPIO
+from picamera2 import Picamera2
+import cv2
+import numpy as np
+from time import sleep
+from Arrows import classify_symbol
+from Template import classify_template
+
+# --- Configuration & Hardware Init ---
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+in1, in2, en1 = 17, 18, 27  # Left Motor
+in3, in4, en2 = 23, 24, 22  # Right Motor
+
+pins = [in1, in2, en1, in3, in4, en2]
+for pin in pins:
+    GPIO.setup(pin, GPIO.OUT)
+
+pwm_left = GPIO.PWM(en1, 500)
+pwm_right = GPIO.PWM(en2, 500)
+pwm_left.start(0)
+pwm_right.start(0)
+
+# --- PID Constants & Memory ---
+Kp, Ki, Kd = 0.3, 0.005, 0.25
+integral = 0
+last_error = 0
+sharp_threshold = 80
+base_speed = 40
+last_movement = 0
+control = 0
+
+# --- DEBUGGING TOOL: HSV PIXEL PICKER ---
+def pick_hsv(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        hsv_frame = cv2.cvtColor(param, cv2.COLOR_BGR2HSV)
+        h, s, v = hsv_frame[y, x]
+        print(f"\n--- HSV Calibration Info ---")
+        print(f"Pixel at ({x}, {y}) | HSV: [{h}, {s}, {v}]")
+        print(f"Suggested: low=[{max(0,h-10)}, 70, 50] high=[{min(180,h+10)}, 255, 255]")
+
+# --- Color Ranges (HSV) --- # Based on the debug code values
+COLOR_RANGES = {
+    "RED_LOW":  {"low": np.array([0, 100, 100]),   "high": np.array([10, 255, 255])},
+    "RED_HIGH": {"low": np.array([160, 100, 100]), "high": np.array([180, 255, 255])},
+    "YELLOW":   {"low": np.array([20, 100, 100]),  "high": np.array([40, 255, 255])},
+    "BLACK":    {"low": np.array([0, 0, 0]),       "high": np.array([180, 255, 137])}
+}
+
+def get_line_centroid(hsv, color_name):
+    
+    if color_name == "RED":
+        # Double Red Logic: Combine the 0-10 and 160-180 ranges
+        mask1 = cv2.inRange(hsv, COLOR_RANGES["RED_LOW"]["low"], COLOR_RANGES["RED_LOW"]["high"])
+        mask2 = cv2.inRange(hsv, COLOR_RANGES["RED_HIGH"]["low"], COLOR_RANGES["RED_HIGH"]["high"])
+        mask = cv2.bitwise_or(mask1, mask2)
+    else:
+        # Standard logic for Yellow and Black
+        lower = COLOR_RANGES[color_name]["low"]
+        upper = COLOR_RANGES[color_name]["high"]
+        mask = cv2.inRange(hsv, lower, upper)
+    
+    # Clean up the noise
+    mask = cv2.dilate(cv2.erode(mask, None, iterations=2), None, iterations=2)
+    
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if len(contours) > 0:
+        c = max(contours, key=cv2.contourArea) # added to fix noise (final edit)
+        if cv2.contourArea(c) > 500:
+            M = cv2.moments(c)
+            if M['m00'] != 0:
+                return int(M['m10'] / M['m00']), int(M['m01'] / M['m00']), mask
+            
+    return None, None, mask
+
+def set_motor(left, right, mode="FORWARD"):
+    left = max(0, min(80, float(left)))
+    right = max(0, min(80, float(right)))
+    if mode == "FORWARD":
+        GPIO.output(in1, 1); GPIO.output(in2, 0); GPIO.output(in3, 1); GPIO.output(in4, 0)
+    elif mode == "REVERSE_LEFT":
+        GPIO.output(in1, 0); GPIO.output(in2, 1); GPIO.output(in3, 1); GPIO.output(in4, 0)
+    elif mode == "REVERSE_RIGHT":
+        GPIO.output(in1, 1); GPIO.output(in2, 0); GPIO.output(in3, 0); GPIO.output(in4, 1)
+    pwm_left.ChangeDutyCycle(left)
+    pwm_right.ChangeDutyCycle(right)
+
+# --- Main Logic ---
+picam2 = Picamera2()
+picam2.configure(picam2.create_video_configuration(main={"format": "XRGB8888", "size": (320, 240)})) #Used Video configuration, preview config adds additional sharpening and post processing that slows down FPS
+picam2.start()
+picam2.set_controls({"AwbEnable": False})
+picam2.set_controls({ "AwbEnable": False, "ColourGains": (1.6, 1.5)}) #Set manual colour gains for red and blue to account for green tint
+picam2.set_controls({"AnalogueGain": 6.0})
+picam2.set_controls({"Brightness": 0.1})
+picam2.set_controls({"ExposureTime": 20000})
+
+#cv2.namedWindow("Robot View")
+state = 'LINE_FOLLOW'
+frame_count = 0
+N = 5
+N2 = 10
+
+try:
+    while True:
+        frame = picam2.capture_array()
+        
+        roi_frame = frame[200:240, 0:320]
+        
+        current_color = "NONE"
+        cX, cY = None, None
+        mask = np.zeros((80,320), dtype=np.uint8) # Default empty mask to prevent crashes
+
+        blurred = cv2.GaussianBlur(roi_frame, (5, 5), 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        
+        # 1. Color Detection (Same as your working version)
+        cX, cY, mask = get_line_centroid(hsv, "RED")
+        if cX is not None:
+            current_color = "RED"
+        else:
+            cX, cY, mask = get_line_centroid(hsv, "YELLOW")
+            if cX is not None:
+                current_color = "YELLOW"
+            else:
+                cX, cY, mask = get_line_centroid(hsv, "BLACK")
+                if cX is not None:
+                    current_color = "BLACK"
+
+        # 2. State Detection (CRITICAL: Increase N2 to 15 or 20)
+        if frame_count % N == 0:
+            sym = classify_symbol(frame)
+            if sym != False: #and sym != "Unknown":
+                #set_motor(15,15,"FORWARD")
+                #sleep(0.1)
+                state = 'SHAPE_DETECTED'
+            
+        elif frame_count % N2 == 0: # Changed N2 from 1 to 20 for speed
+            template = classify_template(frame)
+            if template != False:
+                state = 'TEMPLATE_DETECTED’
+        # 3. Movement Logic
+        if state == 'LINE_FOLLOW':
+            if cX is not None:
+                error = 160 - cX
+                integral = max(-500, min(500, integral + error)) 
+                
+                control = (Kp * error) + (Ki * integral) + (Kd * (error - last_error))
+                last_error = error
+                
+                set_motor(base_speed - control, base_speed + control, "FORWARD")
+                
+                if error < -sharp_threshold:
+                    set_motor(25 + abs(control), 25 + abs(control), "REVERSE_RIGHT")
+                    last_movement = 1
+                elif error > sharp_threshold:
+                    set_motor(25 + abs(control), 25 + abs(control), "REVERSE_LEFT")
+                    last_movement = -1
+            
+        elif cX is None:
+            # Searching logic
+            if last_movement == 1: set_motor(35, 0, "FORWARD")
+            elif last_movement == -1: set_motor(0, 35, "FORWARD")
+
+        elif state == 'TEMPLATE_DETECTED':
+            if template == "Recycle":
+                set_motor(15, 15, "REVERSE_LEFT")
+                sleep(0.5)
+            elif template == "Warning":
+                set_motor(0, 0, "FORWARD")
+                sleep(0.5)
+            
+            state = "LINE_FOLLOW"
+
+        elif state == 'SHAPE_DETECTED':
+            if sym == "Arrow Right":
+                print("TurnedR")
+                set_motor(30,0,"FORWARD")
+                sleep(0.5)
+            elif sym == "Arrow Left":
+                print("TurnedL")
+                set_motor(0,30, "FORWARD")
+                sleep(0.5)
+            state = "LINE_FOLLOW"
+        
+        frame_count += 1
+        #cv2.imshow("Mask", mask) # Now safe because we initialized mask above
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+            
+except KeyboardInterrupt:
+    print("\nEND")
+
+finally:
+    set_motor(0, 0)
+    picam2.stop()
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
+
+The arrow and symbol codes are as shown below:
+
+Arrow code(Arrows):
+
+import cv2
+import numpy as np
+from collections import deque
+
+recognition_buffer = deque(maxlen=3)
+kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+
+def classify_symbol(frame):
+    current_identity = "Unknown"
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                        cv2.THRESH_BINARY_INV, 51, 7)
+    mask = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    
+    contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE) #cv2.RETR_EXTERNAL was switched to cv2.RETR_TREE
+    
+    found = False
+    if hierarchy is not None:
+        # We use hierarchy[0] because it's a 3D array
+        for i, cnt in enumerate(contours):
+            
+            # 2. THE KILLER FILTER: Check for "children"
+            # hierarchy[0][i][2] is the index of the first child contour.
+            # If it's NOT -1, this shape has stuff inside it (like a QR code or Template).
+            # Arrows are solid blocks; they should have NO internal shapes.
+            if hierarchy[0][i][2] != -1:
+                continue # This is a complex sign/QR, skip it!
+        
+            area = cv2.contourArea(cnt)
+        #print(f"Area:{area}")
+            if 600 < area < 8000:
+                x, y, w, h = cv2.boundingRect(cnt)
+                aspect_ratio = float(w) / h
+                #print(f"Aspect:{aspect_ratio}")
+                if 0.5 <= aspect_ratio <= 2.5:
+                    hull = cv2.convexHull(cnt)
+                    solidity = float(area) / cv2.contourArea(hull) if cv2.contourArea(hull) > 0 else 0
+                    #print(f"Solidity:{solidity}")
+                
+            
+                # Arrows have a distinct solidity (0.52 - 0.75)
+                    if 0.3 <= solidity <= 0.65:  #Threshold was reduced from 0.53 to 0.3 after testing values
+                        M = cv2.moments(cnt)
+                        if M["m00"] > 0:
+                            cX, cY = int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])
+                            bX, bY = x + (w/2), y + (h/2)
+    
+                            if abs(cX - bX) > abs(cY - bY):
+                                current_identity = "Arrow Right" if cX > bX else "Arrow Left"
+                            #else:
+                                #current_identity = "Arrow Down" if cY > bY else "Arrow Up"
+                            found = True
+                            break 
+                        
+    if not found:
+        current_identity = "Unknown"
+                        
+    recognition_buffer.append(current_identity)
+    final_decision = max(set(recognition_buffer), key=recognition_buffer.count)
+        
+    color = (0, 255, 0) if final_decision != "Unknown" else (0, 0, 255)
+    cv2.putText(frame, f"ID: {final_decision}", (10, 40), 1, 1.5, color, 2)
+    cv2.imshow("Homography Hybrid System", frame)
+    
+    return final_decision
+        
+Template code (Template):
+
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+from collections import deque
+
+orb = cv2.ORB_create(nfeatures= 400, fastThreshold = 30) #feature detection reduced from 1000
+bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+# --- 2. Buffer Setup ---
+# This stores the last 5 detections to ensure stability
+recognition_buffer = deque(maxlen=5)
+
+template_files = {
+    "Button Code": "/home/rasp4/Downloads/Button code_05.04.2026.png",
+    "Fingerprint": "/home/rasp4/Downloads/Fingerprint full_05.04.2026.png",
+    "Recycle": "/home/rasp4/Downloads/Recycle full_05.04.2026.png",
+    "Warning": "/home/rasp4/Downloads/Warning_07.04.2026.png",
+    "QR Code": "/home/rasp4/Downloads/QR code full_05.04.2026.png"
+}
+
+template_data = {}
+for name, path in template_files.items():
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE) # This ignores color!
+    if img is not None:
+        kp, des = orb.detectAndCompute(img, None)
+        template_data[name] = des
+
+def classify_template(frame):
+    # Convert camera frame to Grayscale so color is ignored
+    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    kp_query, des_query = orb.detectAndCompute(gray_frame, None)
+    
+    current_best = "Unknown"
+    max_good_matches = 0
+    
+    if des_query is not None:
+        for name, des_train in template_data.items():
+            if des_train is not None:
+                matches = bf.match(des_train, des_query)
+                # Filter for quality (m.distance < 30 is a good standard)
+                good_matches = [m for m in matches if m.distance < 30]
+                
+                if len(good_matches) > max_good_matches:
+                    max_good_matches = len(good_matches)
+                    current_best = name
+
+    # --- 3. The Buffer Logic ---
+    # If matches are too low, consider this frame "Unknown"
+    if max_good_matches < 10:
+        recognition_buffer.append("Unknown")
+    else:
+        recognition_buffer.append(current_best)
+
+    # Only display the name if it is the most common item in our 5-frame buffer
+    # This filters out "flickering" wrong guesses
+    final_decision = max(set(recognition_buffer), key=recognition_buffer.count)
+
+    # --- 4. UI Display ---
+    display_color = (0, 255, 0) if final_decision != "Unknown" else (0, 0, 255)
+    cv2.putText(frame, f"Identity: {final_decision}", (10, 40), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, display_color, 2)
+    
+    cv2.imshow("Color-Agnostic Recognition", frame)
+    
+    return final_decision
+    
+
+
+
+
