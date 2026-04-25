@@ -1,0 +1,153 @@
+import RPi.GPIO as GPIO
+from picamera2 import Picamera2
+import cv2
+import numpy as np
+
+# --- Configuration & Hardware Init ---
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+in1, in2, en1 = 17, 18, 27  # Left Motor
+in3, in4, en2 = 23, 24, 22  # Right Motor
+
+pins = [in1, in2, en1, in3, in4, en2]
+for pin in pins:
+    GPIO.setup(pin, GPIO.OUT)
+
+pwm_left = GPIO.PWM(en1, 1000)
+pwm_right = GPIO.PWM(en2, 1000)
+pwm_left.start(0)
+pwm_right.start(0)
+
+# --- PID Constants & Memory ---
+Kp, Ki, Kd = 0.3, 0.005, 0.25
+integral = 0
+last_error = 0
+sharp_threshold = 80
+base_speed = 50
+last_movement = 0 
+
+def pick_hsv(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        hsv_frame = cv2.cvtColor(param, cv2.COLOR_BGR2HSV)
+        h, s, v = hsv_frame[y, x]
+        print(f"\n--- HSV Calibration Info ---")
+        print(f"Pixel at ({x}, {y}) | HSV: [{h}, {s}, {v}]")
+        print(f"Suggested: low=[{max(0,h-10)}, 70, 50] high=[{min(180,h+10)}, 255, 255]")
+
+# --- Color Ranges (HSV) ---
+COLOR_RANGES = {
+    "RED_LOW":  {"low": np.array([0, 100, 100]),   "high": np.array([10, 255, 255])},
+    "RED_HIGH": {"low": np.array([160, 100, 100]), "high": np.array([180, 255, 255])},
+    "YELLOW":   {"low": np.array([20, 100, 100]),  "high": np.array([40, 255, 255])},
+    "BLACK":    {"low": np.array([0, 0, 0]),       "high": np.array([180, 255, 60])}
+}
+
+def get_line_centroid(frame, color_name):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    
+    if color_name == "RED":
+        # Double Red Logic: Combine the 0-10 and 160-180 ranges
+        mask1 = cv2.inRange(hsv, COLOR_RANGES["RED_LOW"]["low"], COLOR_RANGES["RED_LOW"]["high"])
+        mask2 = cv2.inRange(hsv, COLOR_RANGES["RED_HIGH"]["low"], COLOR_RANGES["RED_HIGH"]["high"])
+        mask = cv2.bitwise_or(mask1, mask2)
+    else:
+        # Standard logic for Yellow and Black
+        lower = COLOR_RANGES[color_name]["low"]
+        upper = COLOR_RANGES[color_name]["high"]
+        mask = cv2.inRange(hsv, lower, upper)
+    
+    # Clean up the noise
+    mask = cv2.dilate(cv2.erode(mask, None, iterations=2), None, iterations=2)
+    
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if len(contours) > 0:
+        c = max(contours, key=cv2.contourArea)
+        M = cv2.moments(c)
+        if M['m00'] != 0:
+            return int(M['m10'] / M['m00']), int(M['m01'] / M['m00']), mask
+            
+    return None, None, mask
+
+def set_motor(left, right, mode="FORWARD"):
+    left = max(0, min(80, float(left)))
+    right = max(0, min(80, float(right)))
+    if mode == "FORWARD":
+        GPIO.output(in1, 1); GPIO.output(in2, 0); GPIO.output(in3, 1); GPIO.output(in4, 0)
+    elif mode == "REVERSE_LEFT":
+        GPIO.output(in1, 0); GPIO.output(in2, 1); GPIO.output(in3, 1); GPIO.output(in4, 0)
+    elif mode == "REVERSE_RIGHT":
+        GPIO.output(in1, 1); GPIO.output(in2, 0); GPIO.output(in3, 0); GPIO.output(in4, 1)
+    pwm_left.ChangeDutyCycle(left)
+    pwm_right.ChangeDutyCycle(right)
+
+# --- Main Logic ---
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"format": "XRGB8888", "size": (640, 480)}))
+picam2.start()
+
+cv2.namedWindow("Robot View")
+state = 'LINE_FOLLOW'
+frame_count = 0
+N = 8 
+
+try:
+    while True:
+        frame = picam2.capture_array()
+        cv2.setMouseCallback("Robot View", pick_hsv, frame)
+        
+        current_color = "NONE"
+        cX, cY = None, None
+        
+        # Priority Search: RED -> YELLOW -> BLACK
+        cX, cY, mask = get_line_centroid(frame, "RED")
+        if cX is not None:
+            current_color = "RED"
+        else:
+            cX, cY, mask = get_line_centroid(frame, "YELLOW")
+            if cX is not None:
+                current_color = "YELLOW"
+            else:
+                cX, cY, mask = get_line_centroid(frame, "BLACK")
+                if cX is not None:
+                    current_color = "BLACK"
+
+        if state == 'LINE_FOLLOW':
+            if cX is not None:
+                error = 320 - cX
+                P = Kp * error
+                integral = max(-500, min(500, integral + error))
+                D = Kd * (error - last_error)
+                control = P + (Ki * integral) + D
+                last_error = error
+                
+                if error < -sharp_threshold:
+                    set_motor(25 + abs(control), 25 + abs(control), "REVERSE_RIGHT")
+                    last_movement = 1
+                elif error > sharp_threshold:
+                    set_motor(25 + abs(control), 25 + abs(control), "REVERSE_LEFT")
+                    last_movement = -1
+                else:
+                    set_motor(base_speed - control, base_speed + control, "FORWARD")
+                    last_movement = 0
+                
+                cv2.circle(frame, (cX, cY), 10, (0, 0, 255), -1)
+                cv2.putText(frame, f"FOLLOWING: {current_color}", (10, 30), 0, 0.7, (255, 255, 255), 2)
+            else:
+                if last_movement == 1: set_motor(30, 30, "REVERSE_RIGHT")
+                elif last_movement == -1: set_motor(30, 30, "REVERSE_LEFT")
+                cv2.putText(frame, "SEARCHING...", (10, 30), 0, 0.7, (0, 0, 255), 2)
+
+        cv2.putText(frame, f"Frame: {frame_count}", (10, 460), 0, 0.5, (255, 255, 255), 1)
+        cv2.imshow("Robot View", frame)
+        cv2.imshow("Mask", mask)
+        
+        frame_count += 1
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+finally:
+    set_motor(0, 0)
+    picam2.stop()
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
