@@ -97,6 +97,7 @@ while True:
             right()
             set_speed(50)
             if cX > 610:
+                stop()
                 time.sleep(1)
                 right()
                 set_speed(100)
@@ -105,6 +106,7 @@ while True:
             left()
             set_speed(50)
             if cX < 10:
+                stop()
                 time.sleep(1)
                 left()
                 set_speed(100)
