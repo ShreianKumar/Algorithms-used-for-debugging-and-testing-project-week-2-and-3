@@ -100,9 +100,8 @@ while True:
             D = Kd * derivative
             control = P + I + D
             last_error = error
-            right_speed = 25 -(error)
-            left_speed = 0
-            
+            right_speed = 0
+            left_speed = 25 - (control)            
             left_speed = max(0, min(100, left_speed))
             right_speed = max(0, min(100, right_speed))
 
@@ -118,8 +117,8 @@ while True:
             D = Kd * derivative
             control = P + I + D
             last_error = error
-            right_speed = 0
-            left_speed = 25 + (error)
+            right_speed = 25 + (control)
+            left_speed = 0
             left_speed = max(0, min(100, left_speed))
             right_speed = max(0, min(100, right_speed))
 
