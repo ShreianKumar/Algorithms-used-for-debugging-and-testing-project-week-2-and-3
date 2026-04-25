@@ -1,0 +1,239 @@
+import threading
+import time
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+from picamera2 import Picamera2
+from collections import deque
+
+# --- 1. Shared State for Thread Coordination ---
+class SharedState:
+    def __init__(self):
+        self.frame = None          # Raw frame from camera
+        self.debug_frame = None    # Annotated frame for display
+        self.running = True
+        self.lock = threading.Lock()
+        
+        # Communication between Vision and Motor
+        self.line_cx = None
+        self.active_symbol = "None"
+        self.active_arrow = "None"
+        self.current_color = "None"
+        
+        # Movement State for recovery
+        self.last_dir = 0 # -1: Left, 1: Right
+
+state = SharedState()
+
+# --- 2. Hardware & GPIO Setup ---
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# Pins: Left (17, 18, 27) | Right (23, 24, 22)
+PINS = {"L": (17, 18, 27), "R": (23, 24, 22)}
+for side in PINS.values():
+    for pin in side: GPIO.setup(pin, GPIO.OUT)
+
+pwm_l = GPIO.PWM(27, 800); pwm_r = GPIO.PWM(22, 800)
+pwm_l.start(0); pwm_r.start(0)
+
+def set_motors(l, r, mode="FORWARD"):
+    l, r = max(0, min(80, float(l))), max(0, min(80, float(r)))
+    if mode == "FORWARD":
+        GPIO.output(17, 1); GPIO.output(18, 0); GPIO.output(23, 1); GPIO.output(24, 0)
+    elif mode == "REVERSE_LEFT":
+        GPIO.output(17, 0); GPIO.output(18, 1); GPIO.output(23, 1); GPIO.output(24, 0)
+    elif mode == "REVERSE_RIGHT":
+        GPIO.output(17, 1); GPIO.output(18, 0); GPIO.output(23, 0); GPIO.output(24, 1)
+    pwm_l.ChangeDutyCycle(l); pwm_r.ChangeDutyCycle(r)
+
+# --- 3. Thread: Camera Capture ---
+def thread_camera():
+    picam2 = Picamera2()
+    config = picam2.create_video_configuration(main={"format": "XRGB8888", "size": (320, 240)})
+    picam2.configure(config)
+    picam2.start()
+    # Fixed exposure helps color consistency
+    picam2.set_controls({"AnalogueGain":6.0})
+    picam2.set_controls({"ExposureTime": 10000}) 
+    
+    while state.running:
+        frame = picam2.capture_array()
+        with state.lock:
+            state.frame = frame
+    picam2.stop()
+
+# --- 4. Thread: Vision (ORB, Shapes, and Line Priority) ---
+def thread_vision():
+    # Setup ORB
+    orb = cv2.ORB_create(nfeatures=1200)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    
+    # Template Loading
+    TEMPLATE_FILES = {
+        "Button Code": "/home/rasp4/Downloads/Button code_05.04.2026.png",
+        "Fingerprint": "/home/rasp4/Downloads/Fingerprint full_05.04.2026.png",
+        "Recycle": "/home/rasp4/Downloads/Recycle full_05.04.2026.png",
+        "Hazard": "/home/rasp4/Desktop/Pic Symbols/Hazard.jpeg",
+        "QR Code": "/home/rasp4/Downloads/QR code full_05.04.2026.png"
+    }
+    
+    templates = {}
+    for name, path in TEMPLATE_FILES.items():
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            _, des = orb.detectAndCompute(img, None)
+            templates[name] = des
+
+    sym_buffer = deque(maxlen=3)
+
+    while state.running:
+        with state.lock:
+            if state.frame is None: continue
+            img = state.frame.copy()
+
+        debug_img = img.copy()
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # A. LINE DETECTION (Priority Logic: Red > Yellow > Black)
+        roi = img[170:240, 0:320]
+        hsv = cv2.cvtColor(cv2.GaussianBlur(roi, (5, 5), 0), cv2.COLOR_BGR2HSV)
+        
+        found_cx, col_name, col_bgr = None, "None", (125, 125, 125)
+        
+        # Red Masks (Dual Range)
+        r_low = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255]))
+        r_high = cv2.inRange(hsv, np.array([160, 100, 100]), np.array([180, 255, 255]))
+        
+        masks = [
+            (cv2.bitwise_or(r_low, r_high), "RED", (0, 0, 255)),
+            (cv2.inRange(hsv, np.array([20, 100, 100]), np.array([40, 255, 255])), "YELLOW", (0, 255, 255)),
+            (cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 75])), "BLACK", (0, 0, 0))
+        ]
+
+        for mask, name, bgr in masks:
+            M = cv2.moments(mask)
+            if M["m00"] > 500:
+                found_cx = int(M["m10"] / M["m00"])
+                col_name, col_bgr = name, bgr
+                cv2.circle(debug_img, (found_cx, 205), 10, col_bgr, -1)
+                break
+
+        # B. SYMBOL DETECTION (ORB Template Matching)
+        _, des_q = orb.detectAndCompute(gray, None)
+        best_sym = "None"
+        if des_q is not None:
+            max_m = 0
+            for name, des_t in templates.items():
+                matches = bf.match(des_t, des_q)
+                good = [m for m in matches if m.distance < 33]
+                if len(good) > max_m and len(good) > 12:
+                    max_m, best_sym = len(good), name
+        
+        sym_buffer.append(best_sym)
+        active_sym = max(set(sym_buffer), key=sym_buffer.count)
+
+        # C. SHAPE DETECTION (Arrow Contours)
+        active_arrow = "None"
+        if active_sym == "None":
+            blur = cv2.GaussianBlur(gray, (5, 5), 0)
+            thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 7)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                if 1500 < cv2.contourArea(cnt) < 5000:
+                    approx = cv2.approxPolyDP(cnt, 0.03 * cv2.arcLength(cnt, True), True)
+                    if 5 <= len(approx) <= 10:
+                        x, y, w, h = cv2.boundingRect(approx)
+                        M = cv2.moments(cnt)
+                        if M["m00"] > 0:
+                            cX, cY = int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])
+                            bX, bY = x + (w/2), y + (h/2)
+                            if abs(cX - bX) > abs(cY - bY):
+                                active_arrow = "Arrow Right" if cX > bX else "Arrow Left"
+        
+                            cv2.drawContours(debug_img, [approx], -1, (0, 255, 0), 2)
+
+        # D. HUD DRAWING
+        cv2.rectangle(debug_img, (0, 0), (190, 100), (40, 40, 40), -1)
+        cv2.putText(debug_img, f"LINE: {col_name}", (10, 25), 1, 1.2, col_bgr, 2)
+        cv2.putText(debug_img, f"SYM: {active_sym}", (10, 55), 1, 1.2, (255, 255, 255), 2)
+        cv2.putText(debug_img, f"ARR: {active_arrow}", (10, 85), 1, 1.2, (0, 255, 0), 2)
+        cv2.line(debug_img, (0, 170), (320, 170), (255, 255, 0), 1)
+
+        with state.lock:
+            state.line_cx = found_cx
+            state.current_color = col_name
+            state.active_symbol = active_sym
+            state.active_arrow = active_arrow
+            state.debug_frame = debug_img
+        
+        time.sleep(0.08) # Limits vision to save FPS/CPU
+
+# --- 5. Thread: Motor Control (PID) ---
+def thread_motor():
+    Kp, Ki, Kd = 0.3, 0.005, 0.25
+    integral, last_err = 0, 0
+    base = 40
+
+    while state.running:
+        with state.lock:
+            cx, sym, arrow = state.line_cx, state.active_symbol, state.active_arrow
+        
+        # 1. Action: Symbols
+        if sym in ["Hazard", "Button Code"]:
+            set_motors(0, 0); time.sleep(3.0)
+            with state.lock: state.active_symbol = "None"
+        elif sym == "Recycle":
+            set_motors(40, 40, "REVERSE_RIGHT"); time.sleep(1.4)
+            with state.lock: state.active_symbol = "None"
+        elif sym in ["QR Code", "Fingerprint"]:
+            print("Biometric Logged")
+            with state.lock: state.active_symbol = "None"
+
+        # 2. Action: Arrows
+        elif arrow != "None":
+            if arrow == "Arrow Right": set_motors(40, 0); time.sleep(0.4)
+            elif arrow == "Arrow Left": set_motors(0, 40); time.sleep(0.4)
+            with state.lock: state.active_arrow = "None"
+
+        # 3. Action: Line PID
+        elif cx is not None:
+            err = 160 - cx
+            integral = max(-500, min(500, integral + err))
+            turn = (Kp * err) + (Ki * integral) + (Kd * (err - last_err))
+            set_motors(base - turn, base + turn)
+            last_err = err
+            if err < -40:
+                set_motors(25 + abs(turn), 25 + abs(turn), "REVERSE_RIGHT")
+            elif err > 40:
+                set_motors(25 + abs(turn), 25 + abs(turn), "REVERSE_LEFT")
+            state.last_dir = 1 if err < -80 else -1 if err > 80 else 0
+        else:
+            if state.last_dir == 1: 
+                set_motors(45, 0, "FORWARD")
+            elif state.last_dir == -1: 
+                set_motors(0, 45, "FORWARD")
+
+        time.sleep(0.01)
+
+# --- 6. Main Execution ---
+if __name__ == "__main__":
+    t1 = threading.Thread(target=thread_camera)
+    t2 = threading.Thread(target=thread_vision)
+    t3 = threading.Thread(target=thread_motor)
+    
+    for t in [t1, t2, t3]: t.start()
+
+    try:
+        while True:
+            with state.lock:
+                if state.debug_frame is not None:
+                    cv2.imshow("Robot Master Debug", state.debug_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    finally:
+        state.running = False
+        time.sleep(0.5)
+        set_motors(0, 0)
+        GPIO.cleanup()
+        cv2.destroyAllWindows()
